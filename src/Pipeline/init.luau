@@ -1,434 +1,413 @@
--- Shared/Pipeline/init.luau
+-- src/Pipeline/init.luau
 --!strict
---!optimize 2
 
-export type MessageKind = "FireAllClients" | "FireClient" | "FireServer" | "InvokeClient" | "InvokeServer" | "Relay"
+local Pipeline = {}
+Pipeline.__index = Pipeline
 
-export type Message = {
-	name: string,
-	kind: MessageKind,
-	target: Player?,
-	args: { any },
-	paramTypes: { string }?,
-	dropped: boolean,
-	results: { any }?,
-	isRelay: boolean?,
-	id: string,
-	sentAt: number,
-	encoded: buffer?,
-	batched: boolean?,
-}
+local Channel = {}
+Channel.__index = Channel
 
-export type StageHandler = (network: Network, message: Message) -> ()
+--# Services
 
-export type HandlerSlot = {
-	handle: (self: any, network: Network, message: Message) -> (),
-	module: any,
-}
-
-export type Pipeline = { [string]: { HandlerSlot } }
-
-export type Connection = {
-	Disconnect: (self: Connection) -> (),
-}
-
-export type Signal = {
-	Connect: (self: Signal, callback: (...any) -> ()) -> Connection,
-	Fire: (self: Signal, ...any) -> (),
-}
-
-export type RemoteEventObject = {
-	name: string,
-	OnServerEvent: Signal,
-	OnClientEvent: Signal,
-
-	FireAllClients: (self: RemoteEventObject, ...any) -> (),
-	FireClient: (self: RemoteEventObject, player: Player, ...any) -> (),
-	FireServer: (self: RemoteEventObject, ...any) -> (),
-	Relay: (self: RemoteEventObject, target: Player, ...any) -> (),
-	OnServer: (self: RemoteEventObject, callback: (...any) -> ()) -> Connection,
-	OnClient: (self: RemoteEventObject, callback: (...any) -> ()) -> Connection,
-}
-
-export type RemoteFunctionObject = {
-	name: string,
-	OnServerInvoke: ((player: Player, ...any) -> ...any)?,
-	OnClientInvoke: ((...any) -> ...any)?,
-
-	InvokeServer: (self: RemoteFunctionObject, ...any) -> ...any,
-	InvokeClient: (self: RemoteFunctionObject, player: Player, ...any) -> ...any,
-}
-
-export type Network = {
-	registry: any,
-	pipeline: Pipeline,
-	events: { [string]: RemoteEventObject },
-	functions: { [string]: RemoteFunctionObject },
-
-	Init: (self: Network, registry: any, name: string) -> (),
-	GetEvent: (self: Network, name: string) -> RemoteEventObject,
-	GetFunction: (self: Network, name: string) -> RemoteFunctionObject,
-	GetPipeline: (self: Network) -> Pipeline,
-}
-
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 
-local UUID = require("@self/Utilities/UUID")
-local Config = require("@self/Core/Config")
-local Serializer = require("@self/Core/Serializer")
-local Stages = require("@self/Stages")
-local Validator = require("@self/Stages/Validation/Validator")
+--# Modules
 
-local FLUSH_INTERVAL_SECONDS: number = 0.05
+local Middleware = require(script.Middleware)
 
-local function findModule(stage: string, typeTag: string): any?
-	for _, entry in Stages.Entries do
-		if entry.stage ~= stage then
-			continue
-		end
-		local modules = entry.modules
-		if not modules then
-			return nil
-		end
-		for i = 1, #modules do
-			local mod = modules[i]
-			if (mod :: any).type == typeTag then
-				return mod
-			end
-		end
-		return nil
+--# Types
+
+export type Direction = Middleware.Direction
+export type Lane = Middleware.Lane
+export type Context = Middleware.Context
+export type MiddlewareHandler = Middleware.Handler
+
+type Receiver = (...unknown) -> ()
+type Next = Middleware.Next
+type Handler = Middleware.Handler
+
+type ChannelFields = {
+	id: number,
+	lane: Lane,
+	network: Network,
+	remote: RemoteEvent | UnreliableRemoteEvent,
+	receiver: Receiver?,
+	sendMiddleware: { Handler },
+	receiveMiddleware: { Handler },
+	sendChain: Next?,
+	receiveChain: Next?,
+}
+
+type NetworkFields = {
+	isServer: boolean,
+	active: boolean,
+	reliable: RemoteEvent,
+	unreliable: UnreliableRemoteEvent,
+	channels: { [number]: Channel },
+	connections: { RBXScriptConnection },
+	sendMiddleware: { Handler },
+	receiveMiddleware: { Handler },
+}
+
+export type Channel = setmetatable<ChannelFields, typeof(Channel)>
+export type Network = setmetatable<NetworkFields, typeof(Pipeline)>
+
+--# Constants
+
+const DEFAULT_NAMESPACE = "Pipeline"
+const MAX_CHANNEL_ID = 65535
+const WAIT_TIMEOUT_SECONDS = 20
+
+--# Helpers
+
+-- The unmodified path passes varargs directly to Roblox without allocating a packet.
+local function fireDirect(channel: Channel, target: Player?, broadcast: boolean, ...: unknown)
+	local network = channel.network
+	if not network.active then
+		return
 	end
-	return nil
+
+	local remote = channel.remote
+	if not network.isServer then
+		remote:FireServer(channel.id, ...)
+		return
+	end
+
+	if broadcast then
+		remote:FireAllClients(channel.id, ...)
+		return
+	end
+
+	if not target then
+		return
+	end
+
+	remote:FireClient(target, channel.id, ...)
 end
 
-local function collectHandlers(stage: string): { HandlerSlot }
-	local handlers: { HandlerSlot } = {}
+local function deliverDirect(channel: Channel, sender: Player?, ...: unknown)
+	local receiver = channel.receiver
+	if not receiver then
+		return
+	end
 
-	for _, entry in Stages.Entries do
-		if entry.stage ~= stage then
-			continue
-		end
-		local modules = entry.modules or {}
-		for i = 1, #modules do
-			local mod: any = modules[i]
-			local handle = mod.Handle
-			if not handle then
-				continue
-			end
-			-- Config-driven stage skipping (optimization 5.11): omit disabled
-			-- handlers from the pipeline entirely.
-			if mod == Serializer and not Config.SerializerEnabled then
-				continue
-			end
-			if mod.config == Config then
-				-- Logger / Tracer carry their own enabled flag; leave the
-				-- runtime check inside Handle. Still include them here so
-				-- Config flips are picked up without a Pipeline rebuild.
-			end
-			handlers[#handlers + 1] = { handle = handle, module = mod } :: HandlerSlot
-		end
-		break
+	if channel.network.isServer then
+		receiver(sender, ...)
+		return
+	end
+
+	receiver(...)
+end
+
+-- Global middleware always runs before middleware registered on a channel.
+local function collectMiddleware(channel: Channel, direction: Direction): { Handler }
+	local network = channel.network
+	local globalHandlers = if direction == "send" then network.sendMiddleware else network.receiveMiddleware
+	local channelHandlers = if direction == "send" then channel.sendMiddleware else channel.receiveMiddleware
+	local count = #globalHandlers + #channelHandlers
+	local handlers: { Handler } = table.create(count)
+
+	for index = 1, #globalHandlers do
+		handlers[index] = globalHandlers[index]
+	end
+
+	for index = 1, #channelHandlers do
+		handlers[#globalHandlers + index] = channelHandlers[index]
 	end
 
 	return handlers
 end
 
-local function buildPipeline(): Pipeline
-	local pipeline: Pipeline = {}
-	local pipelineAny: any = pipeline
-	for _, entry in Stages.Entries do
-		pipelineAny[entry.stage] = collectHandlers(entry.stage)
-	end
-	return pipeline
-end
+-- Middleware chains are compiled only when registration changes, not per packet.
+local function rebuildChannel(channel: Channel)
+	local sendHandlers = collectMiddleware(channel, "send")
+	local receiveHandlers = collectMiddleware(channel, "receive")
 
-local function runStage(network: Network, stage: string, message: Message)
-	local slots = network.pipeline[stage]
-	for i = 1, #slots do
-		if message.dropped then
-			return
-		end
-		local slot = slots[i]
-		slot.handle(slot.module, network, message)
-	end
-end
+	channel.sendChain = nil
+	channel.receiveChain = nil
 
---[[
-	Drives a message through the full pipeline. Relay messages skip the
-	Validation stage (per the project's relay policy: server still
-	rate-limits via PreSend but does not inspect payload semantics).
-]]
-local function runPipeline(network: Network, message: Message)
-	runStage(network, "PreSend", message)
-	if message.dropped then
-		runStage(network, "PostSend", message)
-		return
-	end
-
-	if not message.isRelay then
-		runStage(network, "Validation", message)
-		if message.dropped then
-			runStage(network, "PostSend", message)
-			return
-		end
-	end
-
-	runStage(network, "Sending", message)
-	runStage(network, "PostSend", message)
-end
-
-local Signal = {}
-Signal.__index = Signal
-
-local function createSignal(): Signal
-	return setmetatable({ _handlers = {} }, Signal) :: any
-end
-
-function Signal:Connect(callback: (...any) -> ()): Connection
-	local handlers = (self :: any)._handlers
-	local idx: number = #handlers + 1
-	handlers[idx] = callback
-
-	local connection = {}
-	function connection:Disconnect()
-		if handlers[idx] ~= callback then
-			return
-		end
-		local last: number = #handlers
-		if idx ~= last then
-			handlers[idx] = handlers[last]
-		end
-		handlers[last] = nil
-	end
-	return connection :: Connection
-end
-
-function Signal:Fire(...: any)
-	local handlers = (self :: any)._handlers
-	for i = 1, #handlers do
-		handlers[i](...)
-	end
-end
-
-local function buildMessage(name: string, kind: MessageKind, target: Player?, args: { any }): Message
-	return {
-		name = name,
-		kind = kind,
-		target = target,
-		args = args,
-		paramTypes = nil,
-		dropped = false,
-		results = nil,
-		isRelay = kind == "Relay" or nil,
-		id = UUID.Generate(Config.UUIDMode),
-		sentAt = os.clock(),
-		encoded = nil,
-		batched = nil,
-	}
-end
-
-local function newEventObject(network: Network, name: string): RemoteEventObject
-	local obj = {} :: any
-	obj.name = name
-	obj.OnServerEvent = createSignal()
-	obj.OnClientEvent = createSignal()
-
-	function obj:FireAllClients(...: any)
-		runPipeline(network, buildMessage(name, "FireAllClients", nil, { ... }))
-	end
-
-	function obj:FireClient(player: Player, ...: any)
-		runPipeline(network, buildMessage(name, "FireClient", player, { ... }))
-	end
-
-	function obj:FireServer(...: any)
-		runPipeline(network, buildMessage(name, "FireServer", nil, { ... }))
-	end
-
-	function obj:Relay(target: Player, ...: any)
-		runPipeline(network, buildMessage(name, "Relay", target, { ... }))
-	end
-
-	function obj:OnServer(callback: (...any) -> ())
-		return obj.OnServerEvent:Connect(callback)
-	end
-
-	function obj:OnClient(callback: (...any) -> ())
-		return obj.OnClientEvent:Connect(callback)
-	end
-
-	return obj :: RemoteEventObject
-end
-
-local function newFunctionObject(network: Network, name: string): RemoteFunctionObject
-	local obj = {} :: any
-	obj.name = name
-	obj.OnServerInvoke = nil
-	obj.OnClientInvoke = nil
-
-	function obj:InvokeServer(...: any): ...any
-		local message = buildMessage(name, "InvokeServer", nil, { ... })
-		runPipeline(network, message)
-		if message.results then
-			return table.unpack(message.results)
-		end
-		return
-	end
-
-	function obj:InvokeClient(player: Player, ...: any): ...any
-		local message = buildMessage(name, "InvokeClient", player, { ... })
-		runPipeline(network, message)
-		if message.results then
-			return table.unpack(message.results)
-		end
-		return
-	end
-
-	return obj :: RemoteFunctionObject
-end
-
-local Pipeline = {} :: Network
-(Pipeline :: any).__index = Pipeline;
-(Pipeline :: any).Priority = 100
-
---[[
-	Single lifecycle entry point. Wires every internal component: loads the
-	validator type registry, resets per-stage state, installs Transport and
-	BulkSender, and builds the handler pipeline. Must be called once per
-	Network instance.
-
-	@param registry any The owning registry instance (or nil for standalone use).
-	@param name string The registered name of this module.
-]]
-function Pipeline:Init(registry: any, name: string)
-	self.registry = registry
-	self.events = {}
-	self.functions = {}
-
-	-- Validator: load all built-in type modules and expose NetworkedObjects.
-	Validator:LoadBuiltIns()
-
-	-- Resolve known modules by their internal type tag.
-	local bulkSender = findModule("Sending", "BulkSender")
-	local transport = findModule("Sending", "Transport")
-	local netObj = findModule("PreSend", "NetworkedObjects")
-	local playerRegistry = findModule("PreSend", "PlayerRegistry")
-	local rateLimiter = findModule("PreSend", "RateLimiter")
-	local customValidation = findModule("Validation", "CustomValidation")
-	local tracer = findModule("PostSend", "Tracer")
-	local metrics = findModule("PostSend", "Metrics")
-
-	if netObj then
-		(netObj :: any):Reset()
-		Validator:SetNetworkedObjects(netObj)
-	end
-	if playerRegistry then
-		(playerRegistry :: any):Reset()
-	end
-	if rateLimiter then
-		(rateLimiter :: any):Reset()
-	end
-	if customValidation then
-		(customValidation :: any):Reset()
-	end
-	if tracer then
-		(tracer :: any):Reset()
-	end
-	if metrics then
-		(metrics :: any):Reset()
-	end
-
-	-- Serializer: thin dispatcher over the validator type registry.
-	Serializer:SetValidator(Validator)
-
-	-- BulkSender: reset queue state and connect the flush heartbeat.
-	if bulkSender then
-		local bs: any = bulkSender
-		bs.queue = {}
-		bs.lastFlush = os.clock()
-		bs.network = self
-		bs.flushHook = nil
-
-		if transport then
-			bs.flushHook = function(drained: { any })
-				(transport :: any):FlushBatch(drained)
-			end
-		end
-
-		if bs.heartbeatConnection then
-			(bs.heartbeatConnection :: RBXScriptConnection):Disconnect()
-		end
-		bs.heartbeatConnection = RunService.Heartbeat:Connect(function()
-			if os.clock() - bs.lastFlush < FLUSH_INTERVAL_SECONDS then
-				return
-			end
-			if bs.network == nil then
-				return
-			end
-			bs:Flush()
+	if #sendHandlers > 0 then
+		channel.sendChain = Middleware.Compose(sendHandlers, function(context: Context)
+			fireDirect(channel, context.target, context.broadcast, table.unpack(context.values, 1, context.count))
 		end)
 	end
 
-	-- Transport: create or wait for the shared remotes.
-	if transport and Config.TransportEnabled then
-		if RunService:IsServer() then
-			(transport :: any):SetupServer(self)
-		elseif RunService:IsClient() then
-			task.spawn(function()
-				(transport :: any):SetupClient(self)
-			end)
+	if #receiveHandlers > 0 then
+		channel.receiveChain = Middleware.Compose(receiveHandlers, function(context: Context)
+			deliverDirect(channel, context.sender, table.unpack(context.values, 1, context.count))
+		end)
+	end
+end
+
+local function sendWithMiddleware(channel: Channel, target: Player?, broadcast: boolean, ...: unknown)
+	local chain = channel.sendChain
+	if not chain then
+		return
+	end
+
+	local values = table.pack(...)
+	local context: Context = {
+		id = channel.id,
+		lane = channel.lane,
+		direction = "send",
+		sender = nil,
+		target = target,
+		broadcast = broadcast,
+		values = values,
+		count = values.n,
+	}
+
+	chain(context)
+end
+
+local function receivePacket(network: Network, sender: Player?, lane: Lane, id: unknown, ...: unknown)
+	if not network.active or type(id) ~= "number" then
+		return
+	end
+
+	local channel = network.channels[id]
+	if not channel or channel.lane ~= lane then
+		return
+	end
+
+	local chain = channel.receiveChain
+	if not chain then
+		local receiver = channel.receiver
+		if not receiver then
+			return
 		end
+
+		if network.isServer then
+			receiver(sender, ...)
+			return
+		end
+
+		receiver(...)
+		return
 	end
 
-	self.pipeline = buildPipeline()
+	local values = table.pack(...)
+	local context: Context = {
+		id = channel.id,
+		lane = lane,
+		direction = "receive",
+		sender = sender,
+		target = nil,
+		broadcast = false,
+		values = values,
+		count = values.n,
+	}
+
+	chain(context)
 end
 
---[[
-	Returns the named RemoteEvent-style object, creating it on first access.
+--# Methods
 
-	@param name string Unique remote name.
-	@return RemoteEventObject
-]]
-function Pipeline:GetEvent(name: string): RemoteEventObject
-	assert(type(name) == "string" and name ~= "", "[Pipeline] name must be a non-empty string")
+-- A channel has one receiver; middleware handles shared cross-cutting behavior.
+function Channel.Connect(self: Channel, callback: Receiver)
+	self.receiver = callback
+end
 
-	local existing = self.events[name]
+function Channel.Disconnect(self: Channel)
+	self.receiver = nil
+end
+
+function Channel.Use(self: Channel, direction: Direction, handler: Handler)
+	local handlers = if direction == "send" then self.sendMiddleware else self.receiveMiddleware
+	handlers[#handlers + 1] = handler
+	rebuildChannel(self)
+end
+
+function Channel.FireServer(self: Channel, ...: unknown)
+	if self.network.isServer or not self.network.active then
+		return
+	end
+
+	if not self.sendChain then
+		self.remote:FireServer(self.id, ...)
+		return
+	end
+
+	sendWithMiddleware(self, nil, false, ...)
+end
+
+function Channel.FireClient(self: Channel, player: Player, ...: unknown)
+	if not self.network.isServer or not self.network.active then
+		return
+	end
+
+	if not self.sendChain then
+		self.remote:FireClient(player, self.id, ...)
+		return
+	end
+
+	sendWithMiddleware(self, player, false, ...)
+end
+
+function Channel.FireAllClients(self: Channel, ...: unknown)
+	if not self.network.isServer or not self.network.active then
+		return
+	end
+
+	if not self.sendChain then
+		self.remote:FireAllClients(self.id, ...)
+		return
+	end
+
+	sendWithMiddleware(self, nil, true, ...)
+end
+
+function Pipeline.Channel(self: Network, id: number, lane: Lane?): (Channel?, string?)
+	if not self.active then
+		return nil, "Pipeline has been destroyed"
+	end
+
+	if id % 1 ~= 0 or id < 0 or id > MAX_CHANNEL_ID then
+		return nil, `Channel id must be an integer from 0 to {MAX_CHANNEL_ID}`
+	end
+
+	local actualLane: Lane = lane or "reliable"
+	local existing = self.channels[id]
 	if existing then
-		return existing
+		if existing.lane ~= actualLane then
+			return nil, `Channel {id} is already registered as {existing.lane}`
+		end
+
+		return existing, nil
 	end
 
-	local obj = newEventObject(self, name)
-	self.events[name] = obj
-	return obj
+	local fields: ChannelFields = {
+		id = id,
+		lane = actualLane,
+		network = self,
+		remote = if actualLane == "reliable" then self.reliable else self.unreliable,
+		receiver = nil,
+		sendMiddleware = {},
+		receiveMiddleware = {},
+		sendChain = nil,
+		receiveChain = nil,
+	}
+
+	local channel = setmetatable(fields, Channel)
+	self.channels[id] = channel
+	rebuildChannel(channel)
+
+	return channel, nil
 end
 
---[[
-	Returns the named RemoteFunction-style object, creating it on first access.
-
-	@param name string Unique remote name.
-	@return RemoteFunctionObject
-]]
-function Pipeline:GetFunction(name: string): RemoteFunctionObject
-	assert(type(name) == "string" and name ~= "", "[Pipeline] name must be a non-empty string")
-
-	local existing = self.functions[name]
-	if existing then
-		return existing
+function Pipeline.Use(self: Network, direction: Direction, handler: Handler)
+	if not self.active then
+		return
 	end
 
-	local obj = newFunctionObject(self, name)
-	self.functions[name] = obj
-	return obj
+	local handlers = if direction == "send" then self.sendMiddleware else self.receiveMiddleware
+	handlers[#handlers + 1] = handler
+
+	for _, channel in self.channels do
+		rebuildChannel(channel)
+	end
 end
 
---[[
-	Returns the pipeline table (stage name → list of handler slots). Treat
-	as read-only.
+function Pipeline.Destroy(self: Network)
+	if not self.active then
+		return
+	end
 
-	@return Pipeline
-]]
-function Pipeline:GetPipeline(): Pipeline
-	return self.pipeline
+	self.active = false
+
+	for _, connection in self.connections do
+		connection:Disconnect()
+	end
+
+	table.clear(self.connections)
+	table.clear(self.channels)
+	table.clear(self.sendMiddleware)
+	table.clear(self.receiveMiddleware)
+
+	-- Only the server owns the RemoteEvent instances and may destroy them.
+	if self.isServer then
+		self.reliable:Destroy()
+		self.unreliable:Destroy()
+	end
+end
+
+--# Constructor
+
+-- Construction is explicit: requiring Pipeline never creates remotes or listeners.
+function Pipeline.new(namespace: string?, container: Instance?): (Network?, string?)
+	local name = namespace or DEFAULT_NAMESPACE
+	local parent = container or ReplicatedStorage
+	local reliableName = `{name}Reliable`
+	local unreliableName = `{name}Unreliable`
+	local isServer = RunService:IsServer()
+
+	if name == "" then
+		return nil, "Pipeline namespace cannot be empty"
+	end
+
+	local reliable: RemoteEvent
+	local unreliable: UnreliableRemoteEvent
+
+	if isServer then
+		if parent:FindFirstChild(reliableName) or parent:FindFirstChild(unreliableName) then
+			return nil, `Pipeline remotes for '{name}' already exist`
+		end
+
+		reliable = Instance.new("RemoteEvent")
+		reliable.Name = reliableName
+
+		unreliable = Instance.new("UnreliableRemoteEvent")
+		unreliable.Name = unreliableName
+
+		reliable.Parent = parent
+		unreliable.Parent = parent
+	else
+		local reliableInstance = parent:WaitForChild(reliableName, WAIT_TIMEOUT_SECONDS)
+		local unreliableInstance = parent:WaitForChild(unreliableName, WAIT_TIMEOUT_SECONDS)
+
+		if not reliableInstance or not reliableInstance:IsA("RemoteEvent") then
+			return nil, `Missing RemoteEvent '{reliableName}'`
+		end
+
+		if not unreliableInstance or not unreliableInstance:IsA("UnreliableRemoteEvent") then
+			return nil, `Missing UnreliableRemoteEvent '{unreliableName}'`
+		end
+
+		reliable = reliableInstance
+		unreliable = unreliableInstance
+	end
+
+	local fields: NetworkFields = {
+		isServer = isServer,
+		active = true,
+		reliable = reliable,
+		unreliable = unreliable,
+		channels = {},
+		connections = {},
+		sendMiddleware = {},
+		receiveMiddleware = {},
+	}
+
+	local network = setmetatable(fields, Pipeline)
+
+	if isServer then
+		network.connections[1] = reliable.OnServerEvent:Connect(function(player: Player, id: unknown, ...: unknown)
+			receivePacket(network, player, "reliable", id, ...)
+		end)
+		network.connections[2] = unreliable.OnServerEvent:Connect(function(player: Player, id: unknown, ...: unknown)
+			receivePacket(network, player, "unreliable", id, ...)
+		end)
+	else
+		network.connections[1] = reliable.OnClientEvent:Connect(function(id: unknown, ...: unknown)
+			receivePacket(network, nil, "reliable", id, ...)
+		end)
+		network.connections[2] = unreliable.OnClientEvent:Connect(function(id: unknown, ...: unknown)
+			receivePacket(network, nil, "unreliable", id, ...)
+		end)
+	end
+
+	return network, nil
 end
 
 return Pipeline
